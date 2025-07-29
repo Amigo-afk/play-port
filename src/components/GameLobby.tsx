@@ -1,23 +1,26 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Users, Crown, LogOut, Play, X } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
+import { supabase } from "@/integrations/supabase/client";
+import { useNavigate } from "react-router-dom";
 
 interface Player {
   id: string;
   name: string;
-  isHost: boolean;
+  is_host: boolean;
+  room_id: string;
 }
 
 interface Room {
   id: string;
   code: string;
-  host: string;
-  players: Player[];
-  maxPlayers: number;
+  host_name: string;
+  max_players: number;
+  created_at: string;
 }
 
 export default function GameLobby() {
@@ -26,13 +29,78 @@ export default function GameLobby() {
   const [roomCode, setRoomCode] = useState('');
   const [currentRoom, setCurrentRoom] = useState<Room | null>(null);
   const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [loading, setLoading] = useState(false);
   const { toast } = useToast();
+  const navigate = useNavigate();
 
   const generateRoomCode = () => {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
   };
 
-  const hostRoom = () => {
+  useEffect(() => {
+    if (!currentRoom) return;
+
+    // Subscribe to real-time player updates
+    const channel = supabase
+      .channel('room-players')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'players',
+          filter: `room_id=eq.${currentRoom.id}`
+        },
+        () => {
+          fetchPlayers();
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'DELETE',
+          schema: 'public',
+          table: 'rooms',
+          filter: `id=eq.${currentRoom.id}`
+        },
+        () => {
+          // Room was deleted, go back to landing
+          setCurrentRoom(null);
+          setCurrentPlayer(null);
+          setPlayers([]);
+          setCurrentView('landing');
+          setRoomCode('');
+          toast({
+            title: "Room closed",
+            description: "The host has closed the room.",
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [currentRoom, toast]);
+
+  const fetchPlayers = async () => {
+    if (!currentRoom) return;
+
+    const { data, error } = await supabase
+      .from('players')
+      .select('*')
+      .eq('room_id', currentRoom.id)
+      .order('joined_at', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching players:', error);
+    } else {
+      setPlayers(data || []);
+    }
+  };
+
+  const hostRoom = async () => {
     if (!playerName.trim()) {
       toast({
         title: "Player name required",
@@ -42,32 +110,57 @@ export default function GameLobby() {
       return;
     }
 
+    setLoading(true);
     const newRoomCode = generateRoomCode();
-    const player: Player = {
-      id: '1',
-      name: playerName,
-      isHost: true
-    };
 
-    const room: Room = {
-      id: newRoomCode,
-      code: newRoomCode,
-      host: playerName,
-      players: [player],
-      maxPlayers: 5
-    };
+    try {
+      // Create room
+      const { data: roomData, error: roomError } = await supabase
+        .from('rooms')
+        .insert({
+          code: newRoomCode,
+          host_name: playerName,
+          max_players: 5
+        })
+        .select()
+        .single();
 
-    setCurrentRoom(room);
-    setCurrentPlayer(player);
-    setCurrentView('room');
+      if (roomError) throw roomError;
 
-    toast({
-      title: "Room created!",
-      description: `Room code: ${newRoomCode}`,
-    });
+      // Add host as player
+      const { data: playerData, error: playerError } = await supabase
+        .from('players')
+        .insert({
+          room_id: roomData.id,
+          name: playerName,
+          is_host: true
+        })
+        .select()
+        .single();
+
+      if (playerError) throw playerError;
+
+      setCurrentRoom(roomData);
+      setCurrentPlayer(playerData);
+      setCurrentView('room');
+
+      toast({
+        title: "Room created!",
+        description: `Room code: ${newRoomCode}`,
+      });
+    } catch (error) {
+      console.error('Error creating room:', error);
+      toast({
+        title: "Error",
+        description: "Failed to create room. Please try again.",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const joinRoom = () => {
+  const joinRoom = async () => {
     if (!playerName.trim()) {
       toast({
         title: "Player name required",
@@ -86,64 +179,117 @@ export default function GameLobby() {
       return;
     }
 
-    // Simulate joining room (in real app, this would be an API call)
-    const player: Player = {
-      id: Date.now().toString(),
-      name: playerName,
-      isHost: false
-    };
+    setLoading(true);
 
-    const room: Room = {
-      id: roomCode,
-      code: roomCode,
-      host: "Host Player", // This would come from server
-      players: [
-        { id: '1', name: "Host Player", isHost: true },
-        player
-      ],
-      maxPlayers: 5
-    };
+    try {
+      // Find room by code
+      const { data: roomData, error: roomError } = await supabase
+        .from('rooms')
+        .select('*')
+        .eq('code', roomCode.toUpperCase())
+        .single();
 
-    setCurrentRoom(room);
-    setCurrentPlayer(player);
-    setCurrentView('room');
+      if (roomError || !roomData) {
+        toast({
+          title: "Room not found",
+          description: "Please check the room code and try again.",
+          variant: "destructive"
+        });
+        return;
+      }
 
-    toast({
-      title: "Joined room!",
-      description: `Joined room: ${roomCode}`,
-    });
+      // Check if room is full
+      const { data: existingPlayers, error: playersError } = await supabase
+        .from('players')
+        .select('*')
+        .eq('room_id', roomData.id);
+
+      if (playersError) throw playersError;
+
+      if (existingPlayers && existingPlayers.length >= roomData.max_players) {
+        toast({
+          title: "Room full",
+          description: "This room is already full.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      // Add player to room
+      const { data: playerData, error: playerError } = await supabase
+        .from('players')
+        .insert({
+          room_id: roomData.id,
+          name: playerName,
+          is_host: false
+        })
+        .select()
+        .single();
+
+      if (playerError) throw playerError;
+
+      setCurrentRoom(roomData);
+      setCurrentPlayer(playerData);
+      setCurrentView('room');
+
+      toast({
+        title: "Joined room!",
+        description: `Joined room: ${roomCode.toUpperCase()}`,
+      });
+    } catch (error) {
+      console.error('Error joining room:', error);
+      toast({
+        title: "Error",
+        description: "Failed to join room. Please try again.",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const leaveRoom = () => {
-    setCurrentRoom(null);
-    setCurrentPlayer(null);
-    setCurrentView('landing');
-    setRoomCode('');
+  const leaveRoom = async () => {
+    if (!currentPlayer || !currentRoom) return;
 
-    toast({
-      title: "Left room",
-      description: "You have left the room.",
-    });
-  };
+    try {
+      // Remove player from room
+      await supabase
+        .from('players')
+        .delete()
+        .eq('id', currentPlayer.id);
 
-  const cancelRoom = () => {
-    if (currentPlayer?.isHost) {
+      // If this was the host, delete the entire room
+      if (currentPlayer.is_host) {
+        await supabase
+          .from('rooms')
+          .delete()
+          .eq('id', currentRoom.id);
+      }
+
       setCurrentRoom(null);
       setCurrentPlayer(null);
+      setPlayers([]);
       setCurrentView('landing');
       setRoomCode('');
 
       toast({
-        title: "Room cancelled",
-        description: "The room has been cancelled.",
+        title: "Left room",
+        description: "You have left the room.",
+      });
+    } catch (error) {
+      console.error('Error leaving room:', error);
+      toast({
+        title: "Error",
+        description: "Failed to leave room.",
+        variant: "destructive"
       });
     }
   };
 
-  const startGame = () => {
-    if (!currentRoom || !currentPlayer?.isHost) return;
+  const startGame = async () => {
+    if (!currentRoom || !currentPlayer?.is_host) return;
 
-    if (currentRoom.players.length < 2) {
+    if (players.length < 2) {
       toast({
         title: "Not enough players",
         description: "At least 2 players are required to start the game.",
@@ -152,8 +298,8 @@ export default function GameLobby() {
       return;
     }
 
-    // Navigate to game (white page for now)
-    window.location.href = '/game';
+    // Navigate to game page
+    navigate('/game');
   };
 
   if (currentView === 'landing') {
@@ -177,6 +323,7 @@ export default function GameLobby() {
                 value={playerName}
                 onChange={(e) => setPlayerName(e.target.value)}
                 className="bg-background border-gaming-border focus:ring-neon-purple"
+                disabled={loading}
               />
             </div>
 
@@ -185,9 +332,10 @@ export default function GameLobby() {
                 onClick={hostRoom}
                 className="w-full bg-gradient-primary hover:shadow-neon transition-all duration-300"
                 size="lg"
+                disabled={loading}
               >
                 <Crown className="w-4 h-4 mr-2" />
-                Host Room
+                {loading ? "Creating..." : "Host Room"}
               </Button>
 
               <div className="relative">
@@ -205,15 +353,17 @@ export default function GameLobby() {
                   value={roomCode}
                   onChange={(e) => setRoomCode(e.target.value.toUpperCase())}
                   className="bg-background border-gaming-border focus:ring-neon-blue"
+                  disabled={loading}
                 />
                 <Button 
                   onClick={joinRoom}
                   variant="secondary"
                   className="w-full"
                   size="lg"
+                  disabled={loading}
                 >
                   <Users className="w-4 h-4 mr-2" />
-                  Join Room
+                  {loading ? "Joining..." : "Join Room"}
                 </Button>
               </div>
             </div>
@@ -232,7 +382,7 @@ export default function GameLobby() {
               <div>
                 <h2 className="text-2xl font-bold text-foreground">Room {currentRoom?.code}</h2>
                 <p className="text-sm text-muted-foreground">
-                  {currentRoom?.players.length}/{currentRoom?.maxPlayers} players
+                  {players.length}/{currentRoom?.max_players} players
                 </p>
               </div>
               <Button
@@ -251,13 +401,13 @@ export default function GameLobby() {
               </h3>
               
               <div className="space-y-2">
-                {currentRoom?.players.map((player) => (
+                {players.map((player) => (
                   <div
                     key={player.id}
                     className="flex items-center justify-between p-3 rounded-lg bg-background border border-gaming-border"
                   >
                     <span className="font-medium text-foreground">{player.name}</span>
-                    {player.isHost && (
+                    {player.is_host && (
                       <Badge variant="secondary" className="bg-neon-purple text-white">
                         <Crown className="w-3 h-3 mr-1" />
                         Host
@@ -268,25 +418,25 @@ export default function GameLobby() {
               </div>
             </div>
 
-            {currentPlayer?.isHost && (
+            {currentPlayer?.is_host && (
               <div className="space-y-3 pt-4 border-t border-gaming-border">
                 <Button
                   onClick={startGame}
                   className="w-full bg-gradient-primary hover:shadow-neon transition-all duration-300"
                   size="lg"
-                  disabled={!currentRoom || currentRoom.players.length < 2}
+                  disabled={!currentRoom || players.length < 2}
                 >
                   <Play className="w-4 h-4 mr-2" />
                   Start Game
-                  {currentRoom && currentRoom.players.length < 2 && (
+                  {currentRoom && players.length < 2 && (
                     <span className="ml-2 text-xs opacity-75">
-                      (Need {2 - currentRoom.players.length} more)
+                      (Need {2 - players.length} more)
                     </span>
                   )}
                 </Button>
 
                 <Button
-                  onClick={cancelRoom}
+                  onClick={leaveRoom}
                   variant="destructive"
                   className="w-full"
                   size="sm"
@@ -297,7 +447,7 @@ export default function GameLobby() {
               </div>
             )}
 
-            {!currentPlayer?.isHost && (
+            {!currentPlayer?.is_host && (
               <div className="pt-4 border-t border-gaming-border">
                 <p className="text-center text-sm text-muted-foreground">
                   Waiting for host to start the game...
